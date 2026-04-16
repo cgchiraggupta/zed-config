@@ -1,0 +1,14 @@
+{
+  "name": "anthropic-openai-bridge",
+  "version": "1.0.0",
+  "description": "Bridge server that converts OpenAI API format to Anthropic format for Zed compatibility",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5"
+  }
+}

@@ -4,3 +4,4 @@ node_modules/
 
 # DevContext - AI coding context
 .devctx/
+node_modules/

@@ -10,7 +10,7 @@ const ANTHROPIC_API_KEY = "test";
 const ANTHROPIC_VERSION = "2023-06-01";
 
 app.use(cors());
-app.use(express.json({ limit: "4mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "openai-anthropic-bridge" });
@@ -27,6 +27,37 @@ app.get("/v1/models", async (_req, res) => {
   }
 });
 
+// Convert OpenAI content format to Anthropic content format
+function convertContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content);
+
+  return content.map((block) => {
+    // Plain text block
+    if (block.type === "text") return { type: "text", text: block.text };
+
+    // OpenAI image_url block -> Anthropic base64 image block
+    if (block.type === "image_url" && block.image_url?.url) {
+      const url = block.image_url.url;
+      if (url.startsWith("data:")) {
+        // data:image/png;base64,<data>
+        const [meta, data] = url.split(",");
+        const media_type = meta.split(":")[1].split(";")[0];
+        return {
+          type: "image",
+          source: { type: "base64", media_type, data },
+        };
+      }
+    }
+
+    // Already Anthropic-style image block
+    if (block.type === "image") return block;
+
+    // Fallback
+    return { type: "text", text: block.text || "" };
+  });
+}
+
 app.post("/v1/chat/completions", async (req, res) => {
   try {
     const {
@@ -35,14 +66,11 @@ app.post("/v1/chat/completions", async (req, res) => {
       max_tokens,
       max_completion_tokens,
       temperature,
-      stream,
     } = req.body;
 
-    // Separate system from user/assistant messages
     const systemMessages = (messages || []).filter((m) => m.role === "system");
-    const nonSystemMessages = (messages || []).filter(
-      (m) => m.role !== "system",
-    );
+    const nonSystemMessages = (messages || []).filter((m) => m.role !== "system");
+
     const systemPrompt = systemMessages
       .map((m) =>
         typeof m.content === "string"
@@ -52,22 +80,16 @@ app.post("/v1/chat/completions", async (req, res) => {
       .join("\n")
       .trim();
 
-    // Normalize content to plain string
     const anthropicMessages = nonSystemMessages.map((m) => ({
       role: m.role,
-      content:
-        typeof m.content === "string"
-          ? m.content
-          : Array.isArray(m.content)
-            ? m.content.map((c) => c.text || "").join("\n")
-            : String(m.content),
+      content: convertContent(m.content),
     }));
 
     const body = {
       model,
       max_tokens: max_completion_tokens || max_tokens || 4096,
       messages: anthropicMessages,
-      stream: true, // always stream to Anthropic
+      stream: true,
     };
 
     if (systemPrompt) body.system = systemPrompt;
@@ -86,19 +108,20 @@ app.post("/v1/chat/completions", async (req, res) => {
       },
     );
 
-    // Set SSE headers for Zed
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
     let fullText = "";
     let buffer = "";
+    let inputTokens = 0;
+    let outputTokens = 0;
     const msgId = `chatcmpl-${Date.now()}`;
 
     response.data.on("data", (chunk) => {
       buffer += chunk.toString();
       const lines = buffer.split("\n");
-      buffer = lines.pop(); // keep incomplete line
+      buffer = lines.pop();
 
       for (const line of lines) {
         if (!line.startsWith("data: ")) continue;
@@ -108,6 +131,15 @@ app.post("/v1/chat/completions", async (req, res) => {
         try {
           const event = JSON.parse(data);
 
+          if (event.type === "message_start" && event.message?.usage) {
+            inputTokens = event.message.usage.input_tokens ?? 0;
+            outputTokens = event.message.usage.output_tokens ?? 0;
+          }
+
+          if (event.type === "message_delta" && event.usage) {
+            outputTokens = event.usage.output_tokens ?? outputTokens;
+          }
+
           if (
             event.type === "content_block_delta" &&
             event.delta?.type === "text_delta"
@@ -115,7 +147,6 @@ app.post("/v1/chat/completions", async (req, res) => {
             const text = event.delta.text;
             fullText += text;
 
-            // Send OpenAI-style SSE chunk
             const chunk = {
               id: msgId,
               object: "chat.completion.chunk",
@@ -133,24 +164,17 @@ app.post("/v1/chat/completions", async (req, res) => {
           }
 
           if (event.type === "message_stop") {
-            // Send final chunk
             const finalChunk = {
               id: msgId,
               object: "chat.completion.chunk",
               created: Math.floor(Date.now() / 1000),
               model,
-              choices: [
-                {
-                  index: 0,
-                  delta: {},
-                  finish_reason: "stop",
-                },
-              ],
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
             };
             res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
             res.write("data: [DONE]\n\n");
             res.end();
-            console.log("Response complete, chars:", fullText.length);
+            console.log(`[${new Date().toISOString()}] model=${model} | prompt=${inputTokens} | completion=${outputTokens} | total=${inputTokens + outputTokens}`);
           }
         } catch (_) {}
       }
